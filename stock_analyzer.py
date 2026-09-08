@@ -37,6 +37,13 @@ TPEX_LIST = ['1240', '1259', '1264', '1268', '1294', '1295', '1336', '1565', '15
 
 MY_LIST = ['4979', '6870', '6451', '3450', '3163', '4977', '3363', '6533', '6757', '2345', '2376', '2441', '6285', '2049', '2303', '3653', '2467', '2359', '2308', '3017', '2368', '4576', '2327', '6442', '6531', '6683', '6257', '6223', '8150', '3105', '2634', '8299', '3532', '6213', '3033', '4991', '2449', '6781', '3189', '8046', '3037', '3443', '3491', '2481', '6770', '2408', '8271', '3081', '3665', '6274', '2455', '2454', '2360', '3673', '8021', '4573', '2351', '1560', '8028', '6197', '4958', '8358', '2330', '2383', '1303', '6669', '2137', '3231', '1815', '5475', '5340', '3771', '1519', '3661', '2059', '6805', '6510', '3211', '4931', '8210', '3013', '6117', '3693']
 
+# 0050（元大台灣50）成分股：追蹤「臺灣50指數」，每季（3/6/9/12月）審核調整一次，
+# 是規則化的被動指數，成分股清單相對穩定、可公開查證，適合寫死維護。
+# 以下為 2026-09-04 公開持股快照（共51檔），下次調整約在2026年12月，屆時建議
+# 重新核對更新。注意：00981A／00991A是主動式ETF（經理人自由調整持股、無固定
+# 規則、且無完整成分股API），沒有一併做在這裡——硬編碼一份很快就會失準。
+TW0050_LIST = ['2330', '2454', '2308', '2317', '3711', '2383', '2303', '2881', '2891', '3037', '3017', '1303', '2882', '2345', '2887', '2382', '2327', '2885', '2357', '2884', '3008', '2301', '3231', '2886', '2883', '2408', '2890', '2344', '2412', '2892', '2449', '2337', '4938', '2356', '2368', '5880', '1301', '1326', '2002', '1101', '1216', '3045', '4904', '2379', '3034', '1102', '2610', '2618', '2603', '2609', '2615']
+
 
 # ────────────────────────────────────────────────────────────────
 # 自訂清單（我的清單／清單1／清單2／清單3）：存成本機JSON檔，跨次啟動App都會保留
@@ -118,6 +125,110 @@ def fetch_price_data(stock_id: str, token: str, days: int):
     if not j.get("data"):
         raise RuntimeError("無資料（可能代號錯誤）")
     return j["data"]
+
+
+# ── 近3年 P/E 區間（TaiwanStockPER，每股票每次批次分析都會多打一次API）──
+# ETF（如0050）本身沒有EPS，FinMind不會回傳PER資料，這種情況回傳None，不是bug。
+# 取得的PER陣列先過濾掉0、負值、非數字（虧損股常見PER<=0或缺值），再取這3年內
+# 的最大最小值作為區間，最新一筆視為目前P/E。
+def fetch_pe_range(stock_id: str, token: str, years: int = 3):
+    end = datetime.today()
+    start = datetime.today() - timedelta(days=365 * years)
+    fmt = "%Y-%m-%d"
+    url = f"{FINMIND_BASE}?dataset=TaiwanStockPER&data_id={stock_id}&start_date={start.strftime(fmt)}&end_date={end.strftime(fmt)}&token={token}"
+    j = api_fetch(url)
+    rows = j.get("data") or []
+    if not rows:
+        return None
+    rows = sorted(rows, key=lambda r: r["date"])
+    values = []
+    for r in rows:
+        try:
+            v = float(r.get("PER"))
+            if v > 0 and v == v:  # v==v 排除 NaN
+                values.append(v)
+        except (TypeError, ValueError):
+            continue
+    if not values:
+        return None
+    try:
+        current = float(rows[-1].get("PER"))
+        if not (current > 0):
+            current = values[-1]
+    except (TypeError, ValueError):
+        current = values[-1]
+    return {"min": min(values), "max": max(values), "current": current}
+
+
+# ── 盤中即時股價快照（taiwan_stock_tick_snapshot，約10秒更新一次）──
+# 注意：這是 FinMind「只限sponsor會員使用」的端點，跟一般 dataset= 資料不同路徑
+# （https://api.finmindtrade.com/api/v4/taiwan_stock_tick_snapshot，不是 .../data?dataset=...）。
+# 非sponsor會員呼叫會被拒絕，這裡設計成失敗就整批跳過、不中斷主流程。
+REALTIME_SNAPSHOT_URL = "https://api.finmindtrade.com/api/v4/taiwan_stock_tick_snapshot"
+REALTIME_CHUNK_SIZE = 80
+
+
+def _chunk_list(lst, size):
+    return [lst[i:i + size] for i in range(0, len(lst), size)]
+
+
+def fetch_realtime_snapshots(token: str, stock_ids: list):
+    """回傳 (snapshot_map, error_msg)。snapshot_map: {stock_id: row}；
+    error_msg 有值代表整批都失敗（例如非sponsor會員），此時 snapshot_map 為空。"""
+    snapshot_map = {}
+    last_err = None
+    for chunk in _chunk_list(stock_ids, REALTIME_CHUNK_SIZE):
+        params = "&".join(f"data_id={sid}" for sid in chunk)
+        url = f"{REALTIME_SNAPSHOT_URL}?{params}&token={token}"
+        try:
+            r = requests.get(url, timeout=15)
+            if not r.ok:
+                last_err = f"HTTP {r.status_code}：{r.text[:200]}"
+                continue
+            j = r.json()
+            if j.get("status") != 200:
+                last_err = j.get("msg") or f"status={j.get('status')}"
+                continue
+            for row in j.get("data", []):
+                sid = row.get("stock_id")
+                if sid:
+                    snapshot_map[sid] = row
+        except Exception as e:
+            last_err = str(e)
+    return snapshot_map, (None if snapshot_map else last_err)
+
+
+def merge_realtime_snapshot(raw_data: list, snapshot: dict):
+    """把即時快照併入歷史資料的最後一筆：只有在「今天還沒被包含在EOD資料裡」時才附加
+    一筆合成的當日K棒，讓評分／型態辨識／圖表在盤中也能反映當下股價。
+    回傳 (data, injected)。"""
+    if not snapshot or not snapshot.get("date"):
+        return raw_data, False
+    today_str = str(snapshot["date"])[:10]
+    last_date = raw_data[-1]["date"] if raw_data else None
+    if last_date and today_str <= last_date:
+        return raw_data, False
+    try:
+        close = float(snapshot.get("close") or 0)
+    except (TypeError, ValueError):
+        close = 0
+    if not close:
+        return raw_data, False
+    try:
+        open_ = float(snapshot.get("open") or close)
+        high = float(snapshot.get("high") or close)
+        low = float(snapshot.get("low") or close)
+    except (TypeError, ValueError):
+        open_, high, low = close, close, close
+    vol_raw = snapshot.get("total_volume", snapshot.get("volume"))
+    try:
+        vol = float(vol_raw) if vol_raw is not None else 0
+    except (TypeError, ValueError):
+        vol = 0
+    merged = raw_data + [{
+        "date": today_str, "open": open_, "high": high, "low": low, "close": close, "volume": vol,
+    }]
+    return merged, True
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -1254,6 +1365,13 @@ def build_analysis_prompt(r):
     lines.append(f"資料日期：{last['date']}　收盤：{last['close']}　漲跌：{'+' if chg >= 0 else ''}{chg:.2f} ({'+' if chgp >= 0 else ''}{chgp:.2f}%)")
     vol_ratio_txt = f"{(last['volume'] / last['vm20']):.2f}" if last["vm20"] else "N/A"
     lines.append(f"成交量：{last['volume']}　量比(vs MA20量)：{vol_ratio_txt}x")
+    if last.get("macd") is not None and last.get("macdSig") is not None:
+        bias = "（偏多）" if last["macd"] > last["macdSig"] else "（偏空）"
+        lines.append(f"MACD：DIF={last['macd']:.2f}　Signal={last['macdSig']:.2f}　柱狀={last['macdHist']:.2f}{bias}")
+    if last.get("bbU") is not None and last.get("bbL") is not None:
+        bb_w = last["bbU"] - last["bbL"]
+        bb_p = ((last["close"] - last["bbL"]) / bb_w * 100) if bb_w else 50
+        lines.append(f"布林通道：上軌={last['bbU']:.2f}　下軌={last['bbL']:.2f}　股價位置={bb_p:.0f}%")
     lines.append("")
     lines.append(f"【朱家泓四維度評分】總分 {r['total']}/100")
     lines.append(f"趨勢 {r['tr']['score']}/25、K線 {r['kl']['score']}/25、均線 {r['ma']['score']}/25、成交量 {r['vl']['score']}/25")
@@ -1414,7 +1532,7 @@ with st.sidebar:
     api_token = st.text_input("FinMind API Token", type="password", placeholder="輸入您的Token")
 
     st.subheader("批次股票代號")
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     if c1.button("上市清單", use_container_width=True,
                   type="primary" if st.session_state.active_list == "twse" else "secondary"):
         st.session_state["stock_text_input"] = "\n".join(TWSE_LIST)
@@ -1424,6 +1542,11 @@ with st.sidebar:
                   type="primary" if st.session_state.active_list == "tpex" else "secondary"):
         st.session_state["stock_text_input"] = "\n".join(TPEX_LIST)
         st.session_state.active_list = "tpex"
+        st.rerun()
+    if c3.button("0050成分股", use_container_width=True,
+                  type="primary" if st.session_state.active_list == "0050" else "secondary"):
+        st.session_state["stock_text_input"] = "\n".join(TW0050_LIST)
+        st.session_state.active_list = "0050"
         st.rerun()
 
     # 我的清單／清單1／清單2／清單3：每列一個選取按鈕＋一個 × 清除按鈕
@@ -1518,6 +1641,7 @@ with st.sidebar:
             st.warning("批次股票代號目前是空的，沒有可儲存的內容")
 
     days = st.slider("分析天數", min_value=90, max_value=365, value=180, step=30)
+    use_realtime = st.checkbox("🔴 加入盤中即時股價（需FinMind sponsor會員，非sponsor會自動略過）", value=True)
 
     run_clicked = st.button("🔍 批次分析", type="primary", use_container_width=True)
 
@@ -1584,6 +1708,17 @@ def run_batch_analysis():
 
     name_map = fetch_stock_name_map(api_token)
 
+    # 盤中即時股價快照：整批股票一次（或分批）呼叫，避免每檔各打一次API
+    realtime_map, realtime_err = {}, None
+    if use_realtime:
+        status.text("🔴 抓取盤中即時股價快照中...")
+        realtime_map, realtime_err = fetch_realtime_snapshots(api_token, stocks)
+        with log_box:
+            if realtime_err:
+                st.caption(f"⚠️ 即時快照抓取失敗（已略過，僅用歷史資料分析）：{realtime_err}　※此功能限FinMind sponsor會員使用")
+            else:
+                st.caption(f"🔴 已取得 {len(realtime_map)} 檔即時快照")
+
     batch_results = []
     total = len(stocks)
     for i, sid in enumerate(stocks):
@@ -1596,16 +1731,24 @@ def run_batch_analysis():
                  for d in rows],
                 key=lambda x: x["date"],
             )
+            rt_injected = False
+            if use_realtime and sid in realtime_map:
+                raw_data, rt_injected = merge_realtime_snapshot(raw_data, realtime_map[sid])
             name = name_map.get(sid, sid)
+            try:
+                pe_range = fetch_pe_range(sid, api_token, 3)
+            except Exception:
+                pe_range = None  # PER抓不到就顯示無資料，不影響其他分析
             data = enrich(raw_data)
             tr, kl, ma_, vl = score_trend(data), score_kline(data), score_ma(data), score_vol(data)
             pb = check_pullback_buy(data)
             pt = detect_patterns(data, pb)
             total_score = tr["score"] + kl["score"] + ma_["score"] + vl["score"]
             batch_results.append({"stockId": sid, "name": name, "data": data, "tr": tr, "kl": kl,
-                                   "ma": ma_, "vl": vl, "pb": pb, "pt": pt, "total": total_score})
+                                   "ma": ma_, "vl": vl, "pb": pb, "pt": pt, "total": total_score,
+                                   "realtime": rt_injected, "peRange": pe_range})
             with log_box:
-                st.caption(f"✅ {sid} {name}　得分:{total_score}")
+                st.caption(f"✅ {sid} {name}　得分:{total_score}" + ("　🔴即時" if rt_injected else ""))
         except Exception as ex:
             with log_box:
                 st.caption(f"❌ {sid} 失敗：{ex}")
@@ -1660,10 +1803,15 @@ else:
         last = r["data"][-1]
         prev = r["data"][-2] if len(r["data"]) >= 2 else last
         chgp = (last["close"] - prev["close"]) / prev["close"] * 100 if prev["close"] else 0
+        pe = r.get("peRange")
+        pe_txt = "無資料"
+        if pe:
+            pe_txt = f"{pe['current']:.1f}（{pe['min']:.1f}~{pe['max']:.1f}）"
         return {
-            "_idx": i, "股票": f"{r['stockId']} {r['name']}", "總分": r["total"], "評等": score_lbl,
+            "_idx": i, "股票": f"{r['stockId']} {r['name']}" + (" 🔴即時" if r.get("realtime") else ""), "總分": r["total"], "評等": score_lbl,
             "趨勢": r["tr"]["score"], "K線": r["kl"]["score"], "均線": r["ma"]["score"], "成交量": r["vl"]["score"],
             "漲跌%": round(chgp, 2), "收盤": round(last["close"], 1),
+            "近3年P/E區間": pe_txt,
             "回後買進場": ("✅ " if r["pb"]["allPass"] else "❌ ") + pb_txt,
             "型態確認": f"{pt_icon} {pt_txt}",
         }
@@ -1874,6 +2022,35 @@ else:
                                      "股價偏離": f"{diff:+.2f}% ({'上方' if diff > 0 else '下方'})"})
             st.dataframe(pd.DataFrame(ma_rows), hide_index=True, use_container_width=True)
 
+        ic4, ic5 = st.columns(2)
+        with ic4:
+            st.write("**MACD 指標**")
+            if last.get("macd") is not None and last.get("macdSig") is not None:
+                macd_bull = last["macd"] > last["macdSig"]
+                cross = ""
+                if prev.get("macd") is not None and prev.get("macdSig") is not None:
+                    if prev["macd"] <= prev["macdSig"] and last["macd"] > last["macdSig"]:
+                        cross = "　⚡ 黃金交叉"
+                    elif prev["macd"] >= prev["macdSig"] and last["macd"] < last["macdSig"]:
+                        cross = "　⚡ 死亡交叉"
+                st.markdown(f"DIF=**{last['macd']:.2f}**　Signal=**{last['macdSig']:.2f}**　柱狀=**{last['macdHist']:.2f}**")
+                st.caption(("DIF在Signal上方，偏多" if macd_bull else "DIF在Signal下方，偏空") + cross)
+            else:
+                st.caption("資料不足")
+        with ic5:
+            st.write("**布林通道**")
+            if last.get("bbU") is not None and last.get("bbL") is not None:
+                bb_width = last["bbU"] - last["bbL"]
+                bb_pos = ((last["close"] - last["bbL"]) / bb_width * 100) if bb_width else 50
+                bb_width_pct = (bb_width / last["close"] * 100) if last["close"] else 0
+                st.markdown(f"上軌=**{last['bbU']:.2f}**　下軌=**{last['bbL']:.2f}**")
+                bb_lbl = "⚠️ 貼近上軌，注意過熱回檔" if bb_pos > 80 else ("💚 貼近下軌，留意反彈" if bb_pos < 20 else "位於通道中段")
+                if bb_width_pct < 8:
+                    bb_lbl += "　🔸通道收窄，留意變盤"
+                st.caption(f"股價位置：{bb_pos:.0f}%（通道寬度 {bb_width_pct:.1f}%）　{bb_lbl}")
+            else:
+                st.caption("資料不足")
+
         st.divider()
         st.markdown("### 📉 技術分析圖表")
         st.plotly_chart(draw_chart(r["data"], f"{r['stockId']} {r['name']}", r["pt"]), use_container_width=True)
@@ -1890,5 +2067,9 @@ else:
                     "RSI": round(d["rsi"], 2) if d["rsi"] is not None else None,
                     "KD-K": round(d["kdK"], 2) if d["kdK"] is not None else None,
                     "KD-D": round(d["kdD"], 2) if d["kdD"] is not None else None,
+                    "MACD": round(d["macd"], 2) if d.get("macd") is not None else None,
+                    "Signal": round(d["macdSig"], 2) if d.get("macdSig") is not None else None,
+                    "BB上軌": round(d["bbU"], 2) if d.get("bbU") is not None else None,
+                    "BB下軌": round(d["bbL"], 2) if d.get("bbL") is not None else None,
                 })
             st.dataframe(pd.DataFrame(raw_rows), hide_index=True, use_container_width=True)
