@@ -160,6 +160,87 @@ def fetch_pe_range(stock_id: str, token: str, years: int = 3):
     return {"min": min(values), "max": max(values), "current": current}
 
 
+# ── 近3個月營收 YoY／MoM（TaiwanStockMonthRevenue，每股票每次批次分析都會多打一次API）──
+# YoY／MoM 是自己算的（FinMind只給原始revenue，不含增減率），需要抓夠長的區間
+# （往前16個月）才能算出最近3個月當中「最舊那個月」的YoY（要對比去年同月）。
+def fetch_revenue_yoy_mom(stock_id: str, token: str):
+    end = datetime.today()
+    start = datetime.today() - timedelta(days=30 * 16)
+    fmt = "%Y-%m-%d"
+    url = f"{FINMIND_BASE}?dataset=TaiwanStockMonthRevenue&data_id={stock_id}&start_date={start.strftime(fmt)}&end_date={end.strftime(fmt)}&token={token}"
+    j = api_fetch(url)
+    rows = j.get("data") or []
+    if not rows:
+        return None
+    rev_map = {}
+    for r in rows:
+        key = f"{r['revenue_year']}-{r['revenue_month']:02d}"
+        rev_map[key] = r["revenue"]
+    months = sorted(rev_map.keys())
+    last3 = months[-3:]
+    if not last3:
+        return None
+    result = []
+    for key in last3:
+        y, m = (int(p) for p in key.split("-"))
+        rev = rev_map[key]
+        prev_y, prev_m = (y - 1, 12) if m == 1 else (y, m - 1)
+        prev_key = f"{prev_y}-{prev_m:02d}"
+        yoy_key = f"{y - 1}-{m:02d}"
+        mom = ((rev - rev_map[prev_key]) / rev_map[prev_key] * 100) if rev_map.get(prev_key) else None
+        yoy = ((rev - rev_map[yoy_key]) / rev_map[yoy_key] * 100) if rev_map.get(yoy_key) else None
+        result.append({"year": y, "month": m, "revenue": rev, "mom": mom, "yoy": yoy})
+    return result
+
+
+def _last_n_calendar_months(n: int):
+    out = []
+    d = datetime.today().replace(day=1)
+    for _ in range(n):
+        out.insert(0, {"year": d.year, "month": d.month})
+        d = (d - timedelta(days=1)).replace(day=1)
+    return out
+
+
+# ── 近3個月「當月均價」YoY（跟營收YoY用同一組月份，方便橫向比較；若沒給月份清單
+# 則自己算「最近3個日曆月」，讓這個功能可以獨立於營收YoY單獨使用）──
+# 自己抓一段股價區間、按年月分組算平均收盤價，再跟去年同月的均價比。這是獨立於
+# 「分析天數」的另一次 TaiwanStockPrice 查詢（往前抓到最舊那個月的去年同月，
+# 通常要抓超過一年），每股票每次批次分析又會多打一次API。
+def fetch_monthly_avg_price_yoy(stock_id: str, token: str, months_list=None):
+    if not months_list:
+        months_list = _last_n_calendar_months(3)
+    oldest = months_list[0]
+    start = datetime(oldest["year"] - 1, oldest["month"], 1)
+    end = datetime.today()
+    fmt = "%Y-%m-%d"
+    url = f"{FINMIND_BASE}?dataset=TaiwanStockPrice&data_id={stock_id}&start_date={start.strftime(fmt)}&end_date={end.strftime(fmt)}&token={token}"
+    j = api_fetch(url)
+    rows = j.get("data") or []
+    if not rows:
+        return None
+    sums, counts = {}, {}
+    for r in rows:
+        key = str(r["date"])[:7]
+        try:
+            c = float(r["close"])
+        except (TypeError, ValueError):
+            continue
+        if c <= 0:
+            continue
+        sums[key] = sums.get(key, 0) + c
+        counts[key] = counts.get(key, 0) + 1
+    avg_map = {k: sums[k] / counts[k] for k in sums}
+    result = []
+    for m in months_list:
+        key = f"{m['year']}-{m['month']:02d}"
+        yoy_key = f"{m['year'] - 1}-{m['month']:02d}"
+        this_avg, last_avg = avg_map.get(key), avg_map.get(yoy_key)
+        yoy = ((this_avg - last_avg) / last_avg * 100) if (this_avg is not None and last_avg) else None
+        result.append({"year": m["year"], "month": m["month"], "avg": this_avg, "avgLastYear": last_avg, "yoy": yoy})
+    return result
+
+
 # ── 盤中即時股價快照（taiwan_stock_tick_snapshot，約10秒更新一次）──
 # 注意：這是 FinMind「只限sponsor會員使用」的端點，跟一般 dataset= 資料不同路徑
 # （https://api.finmindtrade.com/api/v4/taiwan_stock_tick_snapshot，不是 .../data?dataset=...）。
@@ -1643,6 +1724,11 @@ with st.sidebar:
     days = st.slider("分析天數", min_value=90, max_value=365, value=180, step=30)
     use_realtime = st.checkbox("🔴 加入盤中即時股價（需FinMind sponsor會員，非sponsor會自動略過）", value=True)
 
+    st.caption("以下每勾一項，批次分析都會為每檔股票多打1次API，股票數多時會明顯變慢：")
+    show_pe = st.checkbox("📐 近3年P/E區間", value=False)
+    show_rev = st.checkbox("📈 近3月營收YoY/MoM", value=False)
+    show_pxyoy = st.checkbox("💹 近3月均價YoY（可獨立勾選；若同時勾營收，月份會對齊營收那組）", value=False)
+
     run_clicked = st.button("🔍 批次分析", type="primary", use_container_width=True)
 
     top100_clicked = st.button("🔥 漲幅前100分析", use_container_width=True)
@@ -1735,10 +1821,24 @@ def run_batch_analysis():
             if use_realtime and sid in realtime_map:
                 raw_data, rt_injected = merge_realtime_snapshot(raw_data, realtime_map[sid])
             name = name_map.get(sid, sid)
-            try:
-                pe_range = fetch_pe_range(sid, api_token, 3)
-            except Exception:
-                pe_range = None  # PER抓不到就顯示無資料，不影響其他分析
+            pe_range = None
+            if show_pe:
+                try:
+                    pe_range = fetch_pe_range(sid, api_token, 3)
+                except Exception:
+                    pass  # PER抓不到就顯示無資料，不影響其他分析
+            rev_range = None
+            if show_rev:
+                try:
+                    rev_range = fetch_revenue_yoy_mom(sid, api_token)
+                except Exception:
+                    pass  # 營收抓不到就顯示無資料，不影響其他分析
+            price_yoy_range = None
+            if show_pxyoy:
+                try:
+                    price_yoy_range = fetch_monthly_avg_price_yoy(sid, api_token, rev_range)
+                except Exception:
+                    pass  # 均價YoY抓不到就顯示無資料，不影響其他分析
             data = enrich(raw_data)
             tr, kl, ma_, vl = score_trend(data), score_kline(data), score_ma(data), score_vol(data)
             pb = check_pullback_buy(data)
@@ -1746,7 +1846,8 @@ def run_batch_analysis():
             total_score = tr["score"] + kl["score"] + ma_["score"] + vl["score"]
             batch_results.append({"stockId": sid, "name": name, "data": data, "tr": tr, "kl": kl,
                                    "ma": ma_, "vl": vl, "pb": pb, "pt": pt, "total": total_score,
-                                   "realtime": rt_injected, "peRange": pe_range})
+                                   "realtime": rt_injected, "peRange": pe_range,
+                                   "revRange": rev_range, "priceYoYRange": price_yoy_range})
             with log_box:
                 st.caption(f"✅ {sid} {name}　得分:{total_score}" + ("　🔴即時" if rt_injected else ""))
         except Exception as ex:
@@ -1807,14 +1908,71 @@ else:
         pe_txt = "無資料"
         if pe:
             pe_txt = f"{pe['current']:.1f}（{pe['min']:.1f}~{pe['max']:.1f}）"
-        return {
+
+        def fmt_month_pct(entries, field):
+            if not entries:
+                return "無資料"
+            latest = entries[-1]
+            latest_v = latest.get(field)
+            main = f"{latest['month']}月 {'+' if latest_v is not None and latest_v>=0 else ''}{latest_v:.1f}%" if latest_v is not None else f"{latest['month']}月 N/A"
+            prior = list(reversed(entries[:-1]))
+            sub_parts = []
+            for m in prior:
+                v = m.get(field)
+                sub_parts.append(f"{m['month']}月 " + (f"{'+' if v>=0 else ''}{v:.1f}%" if v is not None else "N/A"))
+            return main + ("　" + "　".join(sub_parts) if sub_parts else "")
+
+        rev = r.get("revRange")
+        yoy_txt = fmt_month_pct(rev, "yoy")
+        mom_txt = fmt_month_pct(rev, "mom")
+        px_range = r.get("priceYoYRange")
+        pxyoy_txt = fmt_month_pct(px_range, "yoy")
+
+        # YoY乖離度＝營收YoY − 均價YoY，3個月都算（不是只算最新月）。
+        # 用(year,month)配對，不用陣列位置對應，避免兩邊月份萬一沒對齊時算錯。
+        # 正值大＝營收成長比股價快（可能還沒完全反映在股價上）；
+        # 負值大＝股價漲幅超前營收成長（留意是否透支）。不用多打API，純算既有資料。
+        div_txt = "需同時勾營收與均價YoY"
+        if rev and px_range:
+            px_by_key = {(p["year"], p["month"]): p for p in px_range}
+            div_list = []
+            for rv_e in rev:
+                px_e = px_by_key.get((rv_e["year"], rv_e["month"]))
+                d = (rv_e["yoy"] - px_e["yoy"]) if (rv_e.get("yoy") is not None and px_e and px_e.get("yoy") is not None) else None
+                div_list.append({"month": rv_e["month"], "div": d})
+
+            def fmt_div(d):
+                return f"{'+' if d>=0 else ''}{d:.1f}pp" if d is not None else "N/A"
+
+            latest_d = div_list[-1]
+            prior_d = list(reversed(div_list[:-1]))
+            if latest_d["div"] is not None:
+                lbl = ("💚 營收優於股價" if latest_d["div"] > 15
+                       else "⚠️ 股價超前營收" if latest_d["div"] < -15 else "大致同步")
+                main = f"{latest_d['month']}月 {fmt_div(latest_d['div'])}　{lbl}"
+            else:
+                main = f"{latest_d['month']}月 N/A"
+            sub_parts = [f"{d['month']}月 {fmt_div(d['div'])}" for d in prior_d]
+            div_txt = main + ("　" + "　".join(sub_parts) if sub_parts else "")
+
+        row = {
             "_idx": i, "股票": f"{r['stockId']} {r['name']}" + (" 🔴即時" if r.get("realtime") else ""), "總分": r["total"], "評等": score_lbl,
             "趨勢": r["tr"]["score"], "K線": r["kl"]["score"], "均線": r["ma"]["score"], "成交量": r["vl"]["score"],
             "漲跌%": round(chgp, 2), "收盤": round(last["close"], 1),
-            "近3年P/E區間": pe_txt,
-            "回後買進場": ("✅ " if r["pb"]["allPass"] else "❌ ") + pb_txt,
-            "型態確認": f"{pt_icon} {pt_txt}",
         }
+        if show_pe:
+            row["近3年P/E區間"] = pe_txt
+        if show_rev:
+            row["近3月營收YoY"] = yoy_txt
+        if show_pxyoy:
+            row["近3月均價YoY"] = pxyoy_txt
+        if show_rev and show_pxyoy:
+            row["YoY乖離度"] = div_txt
+        if show_rev:
+            row["近3月營收MoM"] = mom_txt
+        row["回後買進場"] = ("✅ " if r["pb"]["allPass"] else "❌ ") + pb_txt
+        row["型態確認"] = f"{pt_icon} {pt_txt}"
+        return row
 
     def row_passes_filter(r):
         ok_pb = pb_filter == "全部" or (pb_filter == "✅ 符合進場" and r["pb"]["allPass"]) or (pb_filter == "❌ 不符合" and not r["pb"]["allPass"])
