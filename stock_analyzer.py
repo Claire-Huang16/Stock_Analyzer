@@ -1695,8 +1695,7 @@ with st.sidebar:
 
     stock_text = st.text_area("每行一個，或逗號分隔", height=180, key="stock_text_input")
 
-    save_col1, save_col2 = st.columns(2)
-    if save_col1.button("💾 更新我的清單", use_container_width=True):
+    if st.button("💾 更新我的清單", use_container_width=True):
         stocks = parse_stock_tokens(stock_text)
         if stocks:
             st.session_state.custom_lists["my"] = stocks
@@ -1704,22 +1703,20 @@ with st.sidebar:
             st.success(f"已更新我的清單（{len(stocks)}檔）")
         else:
             st.warning("批次股票代號目前是空的，沒有可儲存的內容")
-    if save_col2.button("➕ 存為清單1/2/3", use_container_width=True):
-        stocks = parse_stock_tokens(stock_text)
-        if stocks:
-            target = next((k for k in ("my1", "my2", "my3") if not st.session_state.custom_lists.get(k)), None)
-            overwritten = target is None
-            if overwritten:
-                target = "my1"  # 三槽都滿了，覆蓋清單1（最舊的）
-            st.session_state.custom_lists[target] = stocks
-            save_custom_lists(st.session_state.custom_lists)
-            label = CUSTOM_LIST_LABELS[target]
-            if overwritten:
-                st.warning(f"三槽已滿，已覆蓋{label}（{len(stocks)}檔）")
+
+    # 存為清單1／清單2／清單3：三個各自獨立的按鈕，直接存進指定槽位（不再是舊版
+    # 「自動找空槽」的邏輯）。Streamlit沒有原生confirm彈窗，所以跟清單的×清除鈕一樣，
+    # 按下就直接覆蓋，不會另外跳確認。
+    save_cols = st.columns(3)
+    for idx, key in enumerate(("my1", "my2", "my3")):
+        if save_cols[idx].button(f"➕ 存為清單{idx+1}", use_container_width=True, key=f"save_{key}"):
+            stocks = parse_stock_tokens(stock_text)
+            if stocks:
+                st.session_state.custom_lists[key] = stocks
+                save_custom_lists(st.session_state.custom_lists)
+                st.success(f"已存入{CUSTOM_LIST_LABELS[key]}（{len(stocks)}檔）")
             else:
-                st.success(f"已存入{label}（{len(stocks)}檔）")
-        else:
-            st.warning("批次股票代號目前是空的，沒有可儲存的內容")
+                st.warning("批次股票代號目前是空的，沒有可儲存的內容")
 
     days = st.slider("分析天數", min_value=90, max_value=365, value=180, step=30)
     use_realtime = st.checkbox("🔴 加入盤中即時股價（需FinMind sponsor會員，非sponsor會自動略過）", value=True)
