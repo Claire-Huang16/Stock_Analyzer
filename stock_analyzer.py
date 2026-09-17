@@ -194,6 +194,40 @@ def fetch_revenue_yoy_mom(stock_id: str, token: str):
     return result
 
 
+# ── 三大法人買賣超（近3個月，逐月加總）──
+# TaiwanStockInstitutionalInvestorsBuySell是「每日」資料，不是月資料，這裡自己依日期
+# 分組加總成月度買賣超。抓約100天回來，涵蓋最近3個完整月份綽綽有餘。
+# 買賣超 = buy - sell（單日、單一法人類別），三大法人合計 = 外資+投信+自營商
+# 三類加總。正值=買超（淨買進），負值=賣超（淨賣出）。單位是FinMind原始股數，
+# 沒有換算成「張」。
+def fetch_institutional_monthly(stock_id: str, token: str):
+    end = datetime.today()
+    start = datetime.today() - timedelta(days=100)
+    fmt = "%Y-%m-%d"
+    url = f"{FINMIND_BASE}?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start.strftime(fmt)}&end_date={end.strftime(fmt)}&token={token}"
+    j = api_fetch(url)
+    rows = j.get("data") or []
+    if not rows:
+        return None
+    month_map = {}
+    for r in rows:
+        d = str(r.get("date", ""))[:10]
+        if len(d) < 7:
+            continue
+        key = d[:7]  # "YYYY-MM"
+        net = (float(r.get("buy") or 0)) - (float(r.get("sell") or 0))
+        month_map[key] = month_map.get(key, 0) + net
+    months = sorted(month_map.keys())
+    last3 = months[-3:]
+    if not last3:
+        return None
+    result = []
+    for key in last3:
+        y, m = (int(p) for p in key.split("-"))
+        result.append({"year": y, "month": m, "net": month_map[key]})
+    return result
+
+
 def _last_n_calendar_months(n: int):
     out = []
     d = datetime.today().replace(day=1)
@@ -1835,6 +1869,7 @@ with st.sidebar:
     show_pe = st.checkbox("📐 近3年P/E區間", value=False)
     show_rev = st.checkbox("📈 近3月營收YoY/MoM", value=False)
     show_pxyoy = st.checkbox("💹 近3月均價YoY（可獨立勾選；若同時勾營收，月份會對齊營收那組）", value=False)
+    show_inst = st.checkbox("🏦 三大法人買賣超（近3月，逐月加總）", value=False)
 
     run_clicked = st.button("🔍 批次分析", type="primary", use_container_width=True)
 
@@ -1946,6 +1981,12 @@ def run_batch_analysis():
                     price_yoy_range = fetch_monthly_avg_price_yoy(sid, api_token, rev_range)
                 except Exception:
                     pass  # 均價YoY抓不到就顯示無資料，不影響其他分析
+            inst_range = None
+            if show_inst:
+                try:
+                    inst_range = fetch_institutional_monthly(sid, api_token)
+                except Exception:
+                    pass  # 法人買賣超抓不到就顯示無資料，不影響其他分析
             data = enrich(raw_data)
             dmi = calc_dmi(data, 14)
             dm = score_dmi(dmi)
@@ -1955,7 +1996,8 @@ def run_batch_analysis():
             batch_results.append({"stockId": sid, "name": name, "data": data, "dm": dm,
                                    "pb": pb, "pt": pt, "total": total_score,
                                    "realtime": rt_injected, "peRange": pe_range,
-                                   "revRange": rev_range, "priceYoYRange": price_yoy_range})
+                                   "revRange": rev_range, "priceYoYRange": price_yoy_range,
+                                   "instRange": inst_range})
             with log_box:
                 st.caption(f"✅ {sid} {name}　得分:{total_score}" + ("　🔴即時" if rt_injected else ""))
         except Exception as ex:
@@ -2171,7 +2213,18 @@ else:
             row["近3月YoY乖離度"] = div_txt
         if show_rev:
             row["近3月營收MoM"] = mom_txt
-        row["回後買進場"] = ("✅ " if r["pb"]["allPass"] else "❌ ") + pb_txt
+
+        # 三大法人買賣超（近3月，逐月加總）：主要顯示改成「近3月合計」，跟其他
+        # 「近3月」欄位維持一致的呈現方式，下面小字保留3個月各自數字。
+        if show_inst:
+            inst_range = r.get("instRange")
+            if inst_range:
+                inst_total = sum(m["net"] for m in inst_range)
+                sub_parts = [f"{m['month']}月{'+' if m['net']>=0 else ''}{round(m['net']):,}" for m in reversed(inst_range)]
+                row["三大法人買賣超(近3月)"] = f"近3月合計{'+' if inst_total>=0 else ''}{round(inst_total):,}　" + "　".join(sub_parts)
+            else:
+                row["三大法人買賣超(近3月)"] = "無資料"
+
         row["型態確認"] = f"{pt_icon} {pt_txt}"
         return row
 
