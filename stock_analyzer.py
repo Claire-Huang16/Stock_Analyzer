@@ -2038,9 +2038,12 @@ else:
 
         # YoY乖離度＝營收YoY − 均價YoY，3個月都算（不是只算最新月）。
         # 用(year,month)配對，不用陣列位置對應，避免兩邊月份萬一沒對齊時算錯。
-        # 正值大＝營收成長比股價快（可能還沒完全反映在股價上）；
-        # 負值大＝股價漲幅超前營收成長（留意是否透支）。不用多打API，純算既有資料。
+        # 主要顯示改成「近3月加總乖離度」（3個月各自的乖離度加總）——單一月份容易
+        # 受單月雜訊干擾，加總後比較能看出持續性的乖離趨勢。3個月各自的乖離度數字
+        # 還是保留顯示（在加總值下面）。正值大＝營收成長比股價快；負值大＝股價漲幅
+        # 超前營收成長。不用多打API，純算既有資料。
         div_txt = "需同時勾營收與均價YoY"
+        div_total = None  # 供排序使用
         if rev and px_range:
             px_by_key = {(p["year"], p["month"]): p for p in px_range}
             div_list = []
@@ -2052,24 +2055,110 @@ else:
             def fmt_div(d):
                 return f"{'+' if d>=0 else ''}{d:.1f}pp" if d is not None else "N/A"
 
-            latest_d = div_list[-1]
-            prior_d = list(reversed(div_list[:-1]))
-            if latest_d["div"] is not None:
-                lbl = ("💚 營收優於股價" if latest_d["div"] > 15
-                       else "⚠️ 股價超前營收" if latest_d["div"] < -15 else "大致同步")
-                main = f"{latest_d['month']}月 {fmt_div(latest_d['div'])}　{lbl}"
+            valid_divs = [d["div"] for d in div_list if d["div"] is not None]
+            if valid_divs:
+                div_total = sum(valid_divs)
+                lbl = ("💚 營收優於股價" if div_total > 45
+                       else "⚠️ 股價超前營收" if div_total < -45 else "大致同步")
+                main = f"近3月合計 {fmt_div(div_total)}　{lbl}"
             else:
-                main = f"{latest_d['month']}月 N/A"
-            sub_parts = [f"{d['month']}月 {fmt_div(d['div'])}" for d in prior_d]
+                main = "當月資料不足"
+            sub_parts = [f"{d['month']}月 {fmt_div(d['div'])}" for d in reversed(div_list)]
             div_txt = main + ("　" + "　".join(sub_parts) if sub_parts else "")
 
         dm = r["dm"]
+        # 布林通道股價位置：跟個股詳細面板用同一套算法（不用多打API，last["bbU"]/
+        # last["bbL"] 在enrich()時就已經算好了）。0%=貼著下軌，100%=貼著上軌，
+        # 50%=通道中央。
+        bb_pos_txt = "無資料"
+        if last.get("bbU") is not None and last.get("bbL") is not None:
+            bb_width = last["bbU"] - last["bbL"]
+            bb_pos = ((last["close"] - last["bbL"]) / bb_width * 100) if bb_width else 50
+            bb_width_pct = (bb_width / last["close"] * 100) if last["close"] else 0
+            bb_pos_txt = f"{bb_pos:.0f}%（寬度{bb_width_pct:.1f}%）"
+
+        # ── MACD狀態 ＋ 布林通道×MACD 情境判斷（強勢突破盤／跌深反彈盤）──
+        # 這是課程常見的「布林通道找位置、MACD做確認」的組合判斷法：
+        #   強勢突破盤＝通道開口放大＋股價貼近上軌（布林找爆發）
+        #             ＋MACD在零軸上且紅柱持續增長（MACD確認不是假突破）
+        #   跌深反彈盤＝股價貼近下軌（布林找相對低點）
+        #             ＋MACD低檔背離＋（近期）黃金交叉（MACD確認下跌動能衰竭）
+        # 低檔背離是真的背離偵測（用跟型態辨識、圖表轉折波同一套 build_zigzag
+        # 找最近兩個轉折低點比較），不是代理指標。
+        macd_state_txt = "無資料"
+        combo_tag = ""
+        if (last.get("macd") is not None and last.get("macdSig") is not None
+                and last.get("macdHist") is not None and prev.get("macdHist") is not None):
+            above_zero = last["macd"] > 0
+            hist_growing = last["macdHist"] > prev["macdHist"]
+            just_golden_cross = (prev.get("macd") is not None and prev.get("macdSig") is not None
+                                  and prev["macd"] <= prev["macdSig"] and last["macd"] > last["macdSig"])
+            # 近3天內的黃金交叉（不是只看今天這一根，容許背離成形後晚1-2天才交叉確認）
+            golden_cross_recent = False
+            rdata = r["data"]
+            for gci in range(max(1, len(rdata) - 3), len(rdata)):
+                gc_cur, gc_prev = rdata[gci], rdata[gci - 1]
+                if (gc_cur.get("macd") is not None and gc_cur.get("macdSig") is not None
+                        and gc_prev.get("macd") is not None and gc_prev.get("macdSig") is not None
+                        and gc_prev["macd"] <= gc_prev["macdSig"] and gc_cur["macd"] > gc_cur["macdSig"]):
+                    golden_cross_recent = True
+                    break
+
+            if above_zero and last["macdHist"] > 0:
+                macd_state_txt = "零軸上・紅柱增長" if hist_growing else "零軸上・紅柱縮短"
+            elif not above_zero and last["macdHist"] < 0:
+                macd_state_txt = "零軸下・綠柱縮短" if hist_growing else "零軸下・綠柱增長"
+            else:
+                macd_state_txt = "交叉轉換中"
+            if just_golden_cross:
+                macd_state_txt += "　⚡剛黃金交叉"
+
+            # 通道開口是否放大：跟5天前的通道寬度比較
+            width_expanding = False
+            if last.get("bbU") is not None and last.get("bbL") is not None:
+                width_now_pct = (last["bbU"] - last["bbL"]) / last["close"] * 100 if last["close"] else 0
+                ref_idx = len(rdata) - 6
+                ref_bar = rdata[ref_idx] if ref_idx >= 0 else None
+                if ref_bar and ref_bar.get("bbU") is not None and ref_bar.get("bbL") is not None and ref_bar["close"]:
+                    width_ref_pct = (ref_bar["bbU"] - ref_bar["bbL"]) / ref_bar["close"] * 100
+                    width_expanding = width_now_pct > width_ref_pct
+            bb_pos_for_combo = None
+            if last.get("bbU") is not None and last.get("bbL") is not None and (last["bbU"] - last["bbL"]):
+                bb_pos_for_combo = (last["close"] - last["bbL"]) / (last["bbU"] - last["bbL"]) * 100
+
+            is_breakout = (bb_pos_for_combo is not None and bb_pos_for_combo >= 80 and width_expanding
+                           and above_zero and last["macdHist"] > 0 and hist_growing)
+
+            # MACD低檔背離：股價創更低但DIF沒有跟著創新低，只看最近60根K棒內的低點
+            divergence_detected = False
+            zz_for_div = build_zigzag(rdata)
+            zz_lows = [p for p in zz_for_div if p["type"] == "L"]
+            if len(zz_lows) >= 2:
+                recent_low, prior_low = zz_lows[-1], zz_lows[-2]
+                within_lookback = recent_low["idx"] >= len(rdata) - 1 - 60
+                macd_at_recent = rdata[recent_low["idx"]].get("macd") if recent_low["idx"] < len(rdata) else None
+                macd_at_prior = rdata[prior_low["idx"]].get("macd") if prior_low["idx"] < len(rdata) else None
+                if within_lookback and macd_at_recent is not None and macd_at_prior is not None:
+                    price_lower_low = recent_low["price"] < prior_low["price"]
+                    macd_higher_low = macd_at_recent > macd_at_prior
+                    divergence_detected = price_lower_low and macd_higher_low
+
+            is_pullback_rebound = (bb_pos_for_combo is not None and bb_pos_for_combo <= 20
+                                    and divergence_detected and golden_cross_recent)
+
+            if is_breakout:
+                combo_tag = "　🚀 強勢突破盤"
+            elif is_pullback_rebound:
+                combo_tag = "　🎯 跌深反彈盤"
+
         row = {
             "_idx": i, "股票": f"{r['stockId']} {r['name']}" + (" 🔴即時" if r.get("realtime") else ""), "多方力道": r["total"], "評等": score_lbl,
             "+DI": round(dm["plusDI"], 1) if dm["plusDI"] is not None else None,
             "-DI": round(dm["minusDI"], 1) if dm["minusDI"] is not None else None,
             "ADX": round(dm["adx"], 1) if dm["adx"] is not None else None,
             "ADXR": round(dm["adxr"], 1) if dm["adxr"] is not None else None,
+            "布林通道位置": bb_pos_txt,
+            "MACD狀態": macd_state_txt + combo_tag,
             "漲跌%": round(chgp, 2), "收盤": round(last["close"], 1),
         }
         if show_pe:
@@ -2079,7 +2168,7 @@ else:
         if show_pxyoy:
             row["近3月均價YoY"] = pxyoy_txt
         if show_rev and show_pxyoy:
-            row["YoY乖離度"] = div_txt
+            row["近3月YoY乖離度"] = div_txt
         if show_rev:
             row["近3月營收MoM"] = mom_txt
         row["回後買進場"] = ("✅ " if r["pb"]["allPass"] else "❌ ") + pb_txt
